@@ -1,4 +1,4 @@
-"""JigsawCNN: wide 4-block architecture with block1..block4 (Sequential) + fc + Sinkhorn."""
+from src.config import cfg
 from src.cnn.layers import (
     Conv2D,
     Mish,
@@ -50,18 +50,18 @@ class JigsawCNN:
         out = self.block2.forward(out)
         out = self.block3.forward(out)
         out = self.block4.forward(out)
-        N = out.shape[0]
-        out_flat = out.reshape(N, -1)
+        n_batch = out.shape[0]
+        out_flat = out.reshape(n_batch, -1)
         fc_out = self.fc.forward(out_flat)
-        logits = fc_out.reshape(N, 16, 16)
+        logits = fc_out.reshape(n_batch, cfg.n_tiles, cfg.n_tiles)
         return self.sinkhorn.forward(logits)
 
     def backward(self, dout):
-        N = dout.shape[0]
+        n_batch = dout.shape[0]
         d_logits = self.sinkhorn.backward(dout)
-        d_fc_out = d_logits.reshape(N, 256)
+        d_fc_out = d_logits.reshape(n_batch, cfg.n_tiles * cfg.n_tiles)
         d_out_flat = self.fc.backward(d_fc_out)
-        d_out = d_out_flat.reshape(N, 512, 4, 4)
+        d_out = d_out_flat.reshape(n_batch, 512, 4, 4)
         d_out = self.block4.backward(d_out)
         d_out = self.block3.backward(d_out)
         d_out = self.block2.backward(d_out)

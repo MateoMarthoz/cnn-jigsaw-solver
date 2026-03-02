@@ -1,6 +1,54 @@
-"""Layer classes: Conv2D, Mish, MaxPool2D, Linear, SinkhornLayer, Sequential, CrossEntropyLossSinkhorn."""
 import numpy as np
 import cupy as cp
+
+from src.config import cfg
+
+
+def im2col(x, kernel_size, stride, padding=0):
+    # x: [batch, in_channels, height, width]
+    if padding > 0:
+        # (pad_start, pad_end) tuple for each dimension
+        x = cp.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)), mode="constant")
+    batch, in_channels, padded_height, padded_width = x.shape
+    out_height = (padded_height - kernel_size) // stride + 1
+    out_width = (padded_width - kernel_size) // stride + 1
+    kernel_row_offsets = cp.tile(cp.repeat(cp.arange(kernel_size, dtype=cp.int32), kernel_size), in_channels)
+    output_row_starts = stride * cp.repeat(cp.arange(out_height, dtype=cp.int32), out_width)
+    kernel_col_offsets = cp.tile(cp.arange(kernel_size, dtype=cp.int32), kernel_size * in_channels)
+    output_col_starts = stride * cp.tile(cp.arange(out_width, dtype=cp.int32), out_height)
+    # row_indices: [in_channels * k * k, out_height * out_width]
+    row_indices = (kernel_row_offsets.reshape(-1, 1) + output_row_starts.reshape(1, -1)).astype(cp.int32)
+    # col_indices: [in_channels * k * k, out_height * out_width]
+    col_indices = (kernel_col_offsets.reshape(-1, 1) + output_col_starts.reshape(1, -1)).astype(cp.int32)
+    # channel_indices: [in_channels * k * k, 1]
+    channel_indices = cp.repeat(cp.arange(in_channels, dtype=cp.int32), kernel_size * kernel_size).reshape(-1, 1)
+    columns = x[:, channel_indices, row_indices, col_indices]
+    # columns: [in_channels * k * k, batch * out_height * out_width]
+    columns = columns.transpose(1, 2, 0).reshape(in_channels * kernel_size * kernel_size, -1)
+    return columns
+
+
+def col2im(col, x_shape, kernel_size, stride, padding=0):
+    # col: [in_channels * k * k, batch * out_height * out_width]
+    batch, in_channels, height, width = x_shape
+    out_height = (height + 2 * padding - kernel_size) // stride + 1
+    out_width = (width + 2 * padding - kernel_size) // stride + 1
+    # col_by_kernel_pos: [in_channels, k, k, out_height, out_width, batch]
+    col_by_kernel_pos = col.reshape(in_channels, kernel_size, kernel_size, out_height, out_width, batch)
+    padded_height = height + 2 * padding
+    padded_width = width + 2 * padding
+    # grad_padded: [batch, in_channels, padded_height, padded_width]
+    grad_padded = cp.zeros((batch, in_channels, padded_height, padded_width), dtype=col.dtype)
+    for kernel_row in range(kernel_size):
+        for kernel_col in range(kernel_size):
+            # grad_slice: [batch, in_channels, out_height, out_width]
+            grad_slice = col_by_kernel_pos[:, kernel_row, kernel_col, :, :, :].transpose(3, 0, 1, 2)
+            grad_padded[:, :, kernel_row : kernel_row + out_height * stride : stride,
+                        kernel_col : kernel_col + out_width * stride : stride] += grad_slice
+    if padding > 0:
+        grad_padded = grad_padded[:, :, padding:-padding, padding:-padding]
+    # grad_padded: [batch, in_channels, height, width]
+    return grad_padded
 
 
 class Layer:
@@ -9,7 +57,6 @@ class Layer:
 
     def backward(self, dY):
         raise NotImplementedError
-
 
 class Conv2D(Layer):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
@@ -23,84 +70,60 @@ class Conv2D(Layer):
         W_np = np.random.randn(out_channels, in_channels, kernel_size, kernel_size).astype(np.float32) * std_dev
         self.W = cp.asarray(W_np)
         self.b = cp.zeros((out_channels, 1), dtype=cp.float32)
-        self.X_pad = None
-        self.X_col = None
-        self.X_shape = None
-
-    def get_im2col_indices(self, x_shape):
-        N, C, H, W = x_shape
-        out_height = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
-        out_width = (W + 2 * self.padding - self.kernel_size) // self.stride + 1
-        i0 = cp.repeat(cp.arange(self.kernel_size, dtype=cp.int32), self.kernel_size)
-        i0 = cp.tile(i0, C)
-        i1 = self.stride * cp.repeat(cp.arange(out_height, dtype=cp.int32), out_width)
-        j0 = cp.tile(cp.arange(self.kernel_size, dtype=cp.int32), self.kernel_size * C)
-        j1 = self.stride * cp.tile(cp.arange(out_width, dtype=cp.int32), out_height)
-        i = (i0.reshape(-1, 1) + i1.reshape(1, -1)).astype(cp.int32)
-        j = (j0.reshape(-1, 1) + j1.reshape(1, -1)).astype(cp.int32)
-        k = cp.repeat(cp.arange(C, dtype=cp.int32), self.kernel_size * self.kernel_size).reshape(-1, 1)
-        return k, i, j
+        self.x_col = None
+        self.x_shape = None
 
     def forward(self, X):
-        self.X_shape = X.shape
-        N, C, H, W = X.shape
-        out_h = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
-        out_w = (W + 2 * self.padding - self.kernel_size) // self.stride + 1
-        self.X_pad = cp.pad(X, ((0, 0), (0, 0), (self.padding, self.padding), (self.padding, self.padding)), mode="constant")
-        k, i, j = self.get_im2col_indices(X.shape)
-        X_col = self.X_pad[:, k, i, j]
-        self.X_col = X_col.transpose(1, 2, 0).reshape(C * self.kernel_size * self.kernel_size, -1)
+        self.x_shape = X.shape
+        batch, channel, height, width = X.shape
+        out_height = (height + 2 * self.padding - self.kernel_size) // self.stride + 1
+        out_width = (width + 2 * self.padding - self.kernel_size) // self.stride + 1
+        # self.x_col: [in_channels * k * k, batch * out_height * out_width]
+        self.x_col = im2col(X, self.kernel_size, self.stride, self.padding)
+        # W_col: [out_channels, in_channels * k * k]
         W_col = self.W.reshape(self.out_channels, -1)
-        out = cp.matmul(W_col.astype(cp.float16), self.X_col.astype(cp.float16)).astype(cp.float32) + self.b
-        out = out.reshape(self.out_channels, out_h, out_w, N).transpose(3, 0, 1, 2)
+        out = cp.einsum('oi,ix->ox', W_col.astype(cp.float16), self.x_col.astype(cp.float16)).astype(cp.float32) + self.b
+        # out: [batch, out_channels, out_height, out_width]
+        out = out.reshape(self.out_channels, out_height, out_width, batch).transpose(3, 0, 1, 2)
         return out
 
     def backward(self, dout):
-        N, C, H, W = self.X_shape
-        K = self.kernel_size
-        out_h = (H + 2 * self.padding - K) // self.stride + 1
-        out_w = (W + 2 * self.padding - K) // self.stride + 1
+        # dout: [batch, out_channels, out_height, out_width]
         dout_reshaped = dout.transpose(1, 2, 3, 0).reshape(self.out_channels, -1)
-        self.dW = cp.matmul(dout_reshaped.astype(cp.float16), self.X_col.T.astype(cp.float16)).astype(cp.float32).reshape(self.W.shape)
-        self.db = cp.sum(dout_reshaped, axis=1, keepdims=True)
+        # dout_reshaped: [out_channels, batch * out_height * out_width]
+        self.dW = cp.einsum('ol,il->oi', dout_reshaped.astype(cp.float16), self.x_col.astype(cp.float16)).astype(cp.float32).reshape(self.W.shape)
+        self.db = cp.einsum('ol->o', dout_reshaped)[:, cp.newaxis]
         W_col = self.W.reshape(self.out_channels, -1)
-        dX_col = cp.matmul(W_col.T.astype(cp.float16), dout_reshaped.astype(cp.float16)).astype(cp.float32)
-        dX_pad = cp.zeros_like(self.X_pad)
-        dX_col_reshaped = dX_col.reshape(C, K, K, out_h * out_w * N).reshape(C, K, K, out_h, out_w, N)
-        for ky in range(K):
-            for kx in range(K):
-                block = dX_col_reshaped[:, ky, kx, :, :, :].transpose(3, 0, 1, 2)
-                dX_pad[:, :, ky : ky + out_h * self.stride : self.stride, kx : kx + out_w * self.stride : self.stride] += block
-        dX = dX_pad[:, :, self.padding:-self.padding, self.padding:-self.padding] if self.padding > 0 else dX_pad
+        # dX_col: [in_channels * k * k, batch * out_height * out_width]
+        dX_col = cp.einsum('io,ol->il', W_col.astype(cp.float16), dout_reshaped.astype(cp.float16)).astype(cp.float32)
+        dX = col2im(dX_col, self.x_shape, self.kernel_size, self.stride, self.padding)
         return dX
-
 
 class Mish(Layer):
     def __init__(self):
-        self.X = None
+        self.x = None
 
     def forward(self, X):
-        self.X = X
-        X_safe = cp.clip(X, -20.0, 20.0)
-        softplus = cp.log1p(cp.exp(X_safe))
+        self.x = X
+        x_safe = cp.clip(X, -20.0, 20.0)
+        softplus = cp.log1p(cp.exp(x_safe))
         out = X * cp.tanh(softplus)
         out = cp.where(X > 20.0, X, out)
         out = cp.where(X < -20.0, cp.zeros_like(X), out)
         return out
 
     def backward(self, dout):
-        X = self.X
-        X_safe = cp.clip(X, -20.0, 20.0)
-        exp_x = cp.exp(X_safe)
-        exp_2x = cp.exp(2 * X_safe)
-        exp_3x = cp.exp(3 * X_safe)
-        omega = exp_3x + 4 * exp_2x + (6 + 4 * X_safe) * exp_x + 4 * (1 + X_safe)
+        X = self.x
+        x_safe = cp.clip(X, -20.0, 20.0)
+        exp_x = cp.exp(x_safe)
+        exp_2x = cp.exp(2 * x_safe)
+        exp_3x = cp.exp(3 * x_safe)
+        omega = exp_3x + 4 * exp_2x + (6 + 4 * x_safe) * exp_x + 4 * (1 + x_safe)
         delta = (exp_x + 1) ** 2 + 1
         derivative = (exp_x * omega) / (delta ** 2)
         derivative = cp.where(X > 20.0, cp.ones_like(X), derivative)
         derivative = cp.where(X < -20.0, cp.zeros_like(X), derivative)
         return dout * derivative
-
 
 class SinkhornLayer(Layer):
     def __init__(self, n_iters=20, temperature=1.0):
@@ -110,45 +133,57 @@ class SinkhornLayer(Layer):
         self.out = None
 
     def forward(self, logits):
+        # logits: [batch, n_tiles, n_tiles]
         self.log_alpha = logits / self.temperature
         for _ in range(self.n_iters):
             max_row = cp.max(self.log_alpha, axis=2, keepdims=True)
-            row_lse = cp.log(cp.sum(cp.exp(self.log_alpha - max_row), axis=2, keepdims=True) + 1e-12) + max_row
+            row_exp = cp.exp(self.log_alpha - max_row)
+            # row_lse: [batch, n_tiles, 1]
+            row_lse = cp.log(cp.einsum('nij->ni', row_exp)[:, :, cp.newaxis] + 1e-12) + max_row
             self.log_alpha = self.log_alpha - row_lse
             max_col = cp.max(self.log_alpha, axis=1, keepdims=True)
-            col_lse = cp.log(cp.sum(cp.exp(self.log_alpha - max_col), axis=1, keepdims=True) + 1e-12) + max_col
+            col_exp = cp.exp(self.log_alpha - max_col)
+            # col_lse: [batch, 1, n_tiles]
+            col_lse = cp.log(cp.einsum('nij->nj', col_exp)[:, cp.newaxis, :] + 1e-12) + max_col
             self.log_alpha = self.log_alpha - col_lse
+        # self.out: [batch, n_tiles, n_tiles]
         self.out = cp.exp(self.log_alpha)
         return self.out
 
     def backward(self, dout):
-        row_sum = cp.sum(self.out * dout, axis=2, keepdims=True)
+        # dout: [batch, n_tiles, n_tiles]
+        # row_sum: [batch, n_tiles, 1]
+        row_sum = cp.einsum('nij,nij->ni', self.out, dout)[:, :, cp.newaxis]
         return self.out * (dout - row_sum) / self.temperature
-
 
 class MaxPool2D(Layer):
     def __init__(self, pool_size=2, stride=2):
         self.pool_size = pool_size
         self.stride = stride
-        self.X_shape = None
-        self.X_col = None
+        self.x_shape = None
+        self.x_col = None
         self.max_idx = None
 
     def forward(self, X):
-        self.X_shape = X.shape
-        N, C, H, W = X.shape
-        out_h = (H - self.pool_size) // self.stride + 1
-        out_w = (W - self.pool_size) // self.stride + 1
-        X_reshaped = X.reshape(N, C, out_h, self.pool_size, out_w, self.pool_size)
-        out = X_reshaped.transpose(0, 1, 2, 4, 3, 5).reshape(N, C, out_h, out_w, self.pool_size * self.pool_size)
-        self.X_col = out
+        # X: [batch, channel, height, width]
+        self.x_shape = X.shape
+        batch, channel, height, width = X.shape
+        out_height = (height - self.pool_size) // self.stride + 1
+        out_width = (width - self.pool_size) // self.stride + 1
+        # x_reshaped: [batch, channel, out_height, pool_size, out_width, pool_size]
+        x_reshaped = X.reshape(batch, channel, out_height, self.pool_size, out_width, self.pool_size)
+        # out: [batch, channel, out_height, out_width, pool_size * pool_size]
+        out = x_reshaped.transpose(0, 1, 2, 4, 3, 5).reshape(batch, channel, out_height, out_width, self.pool_size * self.pool_size)
+        self.x_col = out
+        # self.max_idx: [batch, channel, out_height, out_width]
         self.max_idx = cp.argmax(out, axis=4)
         return cp.max(out, axis=4)
 
     def backward(self, dout):
-        N, C, out_h, out_w = dout.shape
+        # dout: [batch, channel, out_height, out_width]
+        n_batch, n_channels, out_height, out_width = dout.shape
         K = self.pool_size
-        dX_col = cp.zeros_like(self.X_col)
+        dX_col = cp.zeros_like(self.x_col)
         dout_flat = dout.flatten()
         max_idx_flat = self.max_idx.flatten()
         n_elements = dout_flat.size
@@ -156,33 +191,36 @@ class MaxPool2D(Layer):
         abs_idx = max_idx_flat.astype(cp.int32) + idx_offset
         dX_col_flat = dX_col.flatten()
         dX_col_flat[abs_idx] = dout_flat
-        dX_col = dX_col_flat.reshape(self.X_col.shape)
-        dX_col_reshaped = dX_col.reshape(N, C, out_h, out_w, K, K).transpose(1, 4, 5, 0, 2, 3)
-        dX = cp.zeros(self.X_shape, dtype=dout.dtype)
+        dX_col = dX_col_flat.reshape(self.x_col.shape)
+        # dX_col_reshaped: [channel, K, K, batch, out_height, out_width]
+        dX_col_reshaped = dX_col.reshape(n_batch, n_channels, out_height, out_width, K, K).transpose(1, 4, 5, 0, 2, 3)
+        dX = cp.zeros(self.x_shape, dtype=dout.dtype)
         for ky in range(K):
             for kx in range(K):
+                # block: [batch, channel, out_height, out_width]
                 block = dX_col_reshaped[:, ky, kx, :, :, :].transpose(1, 0, 2, 3)
-                dX[:, :, ky : ky + out_h * self.stride : self.stride, kx : kx + out_w * self.stride : self.stride] += block
+                dX[:, :, ky : ky + out_height * self.stride : self.stride, kx : kx + out_width * self.stride : self.stride] += block
         return dX
-
 
 class Linear(Layer):
     def __init__(self, in_features, out_features):
         std = float(np.sqrt(2.0 / in_features))
+        # W_np: [in_features, out_features]
         W_np = np.random.randn(in_features, out_features).astype(np.float32) * std
         self.W = cp.asarray(W_np)
         self.b = cp.zeros((1, out_features), dtype=cp.float32)
-        self.X = None
+        self.x = None
 
     def forward(self, X):
-        self.X = X
-        return X.dot(self.W) + self.b
+        # X: [batch, in_features]
+        self.x = X
+        return cp.einsum('ni,io->no', X, self.W) + self.b
 
     def backward(self, dout):
-        self.dW = self.X.T.dot(dout)
-        self.db = cp.sum(dout, axis=0, keepdims=True)
-        return dout.dot(self.W.T)
-
+        # dout: [batch, out_features]
+        self.dW = cp.einsum('in,no->io', self.x, dout)
+        self.db = cp.einsum('no->o', dout)[cp.newaxis, :]
+        return cp.einsum('no,oi->ni', dout, self.W)
 
 class Sequential(Layer):
     def __init__(self, layers):
@@ -207,23 +245,28 @@ class Sequential(Layer):
                 params.append((layer.b, layer.db))
         return params
 
-
 class CrossEntropyLossSinkhorn(Layer):
     def forward(self, X, Y):
-        N = X.shape[0]
-        self.X = X
+        # X: [n_batch, n_tiles, n_tiles]
+        n_batch = X.shape[0]
+        n_tiles = cfg.n_tiles
+        self.x = X
+        # Y_flat: [n_batch, n_tiles]
         Y_flat = cp.asarray(Y).astype(cp.int32)
-        if Y_flat.ndim != 2 or Y_flat.shape[1] != 16:
+        if Y_flat.ndim != 2 or Y_flat.shape[1] != n_tiles:
             Y_flat = Y_flat.reshape(Y_flat.shape[0], -1)
+        # self.target_one_hot: [n_batch, n_tiles, n_tiles]
         self.target_one_hot = cp.zeros_like(X, dtype=cp.float32)
-        n_idx = cp.arange(N, dtype=cp.int32)[:, None]
-        i_idx = cp.arange(16, dtype=cp.int32)[None, :]
+        n_idx = cp.arange(n_batch, dtype=cp.int32)[:, None]
+        i_idx = cp.arange(n_tiles, dtype=cp.int32)[None, :]
         self.target_one_hot[n_idx, i_idx, Y_flat] = 1.0
         log_probs = cp.log(cp.clip(X, 1e-12, 1.0))
-        return -cp.sum(self.target_one_hot * log_probs) / (N * 16)
+        return -cp.einsum('nij,nij->', self.target_one_hot, log_probs) / (n_batch * n_tiles)
 
-    def backward(self):
-        N = self.X.shape[0]
-        dX = -self.target_one_hot / (self.X + 1e-12)
-        dX /= (N * 16)
+    def backward(self, dout=None):
+        n_batch = self.x.shape[0]
+        n_tiles = cfg.n_tiles
+        # dX: [n_batch, n_tiles, n_tiles]
+        dX = -self.target_one_hot / (self.x + 1e-12)
+        dX /= (n_batch * n_tiles)
         return dX
