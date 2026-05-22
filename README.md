@@ -1,5 +1,7 @@
 # CNN Jigsaw Solver
 
+*March 2026*
+
 A convolutional neural network that recovers the correct arrangement of shuffled image patches in a 32×32 grayscale jigsaw puzzle. The model predicts a global permutation over sixteen 8×8 tiles and is implemented entirely from scratch on the GPU with CuPy, without PyTorch or TensorFlow.
 
 ## Problem
